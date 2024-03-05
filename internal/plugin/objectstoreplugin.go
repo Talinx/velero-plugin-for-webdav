@@ -35,6 +35,7 @@ type WebDAVObjectStore struct {
 	password   string
 	bucketsDir string // bucketsDir ends in / or is empty
 	logLevel   string
+	delimiter  string
 }
 
 func NewWebDAVObjectStore(log logrus.FieldLogger) *WebDAVObjectStore {
@@ -57,9 +58,14 @@ func (w *WebDAVObjectStore) Init(config map[string]string) error {
 	logLevel := config["logLevel"]
 	bucket := config["bucket"]
 	prefix := config["prefix"]
+	delimiter := config["delimiter"]
+	if delimiter == "" {
+		delimiter = "/"
+	}
 	w.root = root
 	w.user = user
 	w.password = password
+	w.delimiter = delimiter
 	if bucketsDir != "" && !strings.HasPrefix(bucketsDir, "/") {
 		bucketsDir = fmt.Sprintf("%s/", bucketsDir)
 	}
@@ -78,6 +84,9 @@ func (w *WebDAVObjectStore) Init(config map[string]string) error {
 	if root != "" && user != "" && password != "" && w.PrintInfos() {
 		w.log.Infof("Server root, username and password for WebDAV are all set")
 	}
+	if w.delimiter != "/" {
+		w.log.Warnf("Using a delimiter other than '/' with the WebDAV plugin is experimental, please test your setup carefully. Delimiter is currently set to '%s'.", w.delimiter)
+	}
 	if w.PrintInfos() {
 		w.log.Infof("Using bucket '%s' with path prefix '%s'", bucket, prefix)
 	}
@@ -95,7 +104,7 @@ func SplitPathToDirAndFilename(path string) (dir string, name string) {
 }
 
 func (w *WebDAVObjectStore) PutObject(bucket string, key string, body io.Reader) error {
-	path := fmt.Sprintf("%s%s/%s", w.bucketsDir, bucket, key)
+	path := fmt.Sprintf("%s%s%s%s", w.bucketsDir, bucket, w.delimiter, key)
 	dir, _ := SplitPathToDirAndFilename(path)
 
 	c := gowebdav.NewClient(w.root, w.user, w.password)
@@ -115,7 +124,7 @@ func (w *WebDAVObjectStore) PutObject(bucket string, key string, body io.Reader)
 }
 
 func (w *WebDAVObjectStore) ObjectExists(bucket, key string) (bool, error) {
-	path := fmt.Sprintf("%s%s/%s", w.bucketsDir, bucket, key)
+	path := fmt.Sprintf("%s%s%s%s", w.bucketsDir, bucket, w.delimiter, key)
 	dir, name := SplitPathToDirAndFilename(path)
 
 	c := gowebdav.NewClient(w.root, w.user, w.password)
@@ -125,14 +134,6 @@ func (w *WebDAVObjectStore) ObjectExists(bucket, key string) (bool, error) {
 		w.log.WithError(err)
 		return false, err
 	}
-
-	// last separator is usually between bucket and key
-	// search for it anyway to make the function more generic in case the delimiter is not "/"
-	// lastSeparatorI := strings.LastIndex(path, "/")
-	// dir, name := "", path
-	// if lastSeparatorI != -1 {
-	// 	dir, name = path[:lastSeparatorI], path[lastSeparatorI+1:]
-	// }
 
 	files, err := c.ReadDir(dir)
 	if err != nil {
@@ -150,7 +151,7 @@ func (w *WebDAVObjectStore) ObjectExists(bucket, key string) (bool, error) {
 }
 
 func (w *WebDAVObjectStore) GetObject(bucket, key string) (io.ReadCloser, error) {
-	path := fmt.Sprintf("%s%s/%s", w.bucketsDir, bucket, key)
+	path := fmt.Sprintf("%s%s%s%s", w.bucketsDir, bucket, w.delimiter, key)
 
 	c := gowebdav.NewClient(w.root, w.user, w.password)
 	err := c.Connect()
@@ -196,6 +197,48 @@ func AddDirsWithCommonPrefixes(w *WebDAVObjectStore, c *gowebdav.Client, accumul
 	return outputAccumulatedDirs, allFilesDirs, nil
 }
 
+func GetAllFiles(w *WebDAVObjectStore, c *gowebdav.Client, accumulatedFiles []string, inputDirs []os.FileInfo, parentDirName string) ([]string, error) {
+	outputAccumulatedFiles := accumulatedFiles
+	for _, currentFile := range inputDirs {
+		completePath := fmt.Sprintf("%s%s/", parentDirName, currentFile.Name())
+		if currentFile.IsDir() {
+			subDirs, err := c.ReadDir(completePath)
+			if err != nil {
+				return outputAccumulatedFiles, err
+			}
+			outputAccumulatedFiles, err = GetAllFiles(w, c, outputAccumulatedFiles, subDirs, completePath)
+			if err != nil {
+				return outputAccumulatedFiles, err
+			}
+		} else {
+			outputAccumulatedFiles = append(outputAccumulatedFiles, completePath)
+		}
+	}
+	return outputAccumulatedFiles, nil
+}
+
+func DeterminePrefixesFromFilesWithDelimiter(fileList []string, delimiter string, prefixToCut string) []string {
+	isPrefixPresent := make(map[string]bool) // keep track of already stored prefixes to not return duplicates
+	var prefixes []string
+	for _, currentFile := range fileList {
+		commonPrefix, found := strings.CutPrefix(currentFile, prefixToCut)
+		if !found {
+			continue
+		}
+		lastDelimiterI := strings.LastIndex(commonPrefix, delimiter)
+		if lastDelimiterI == -1 {
+			continue
+		}
+		currentPrefix := commonPrefix[0:lastDelimiterI]
+		isCurrentPrefixPresent := isPrefixPresent[currentPrefix]
+		if !isCurrentPrefixPresent {
+			prefixes = append(prefixes, currentPrefix)
+			isPrefixPresent[currentPrefix] = true
+		}
+	}
+	return prefixes
+}
+
 func (w *WebDAVObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string) ([]string, error) {
 	/* List all folders in the directory named by the bucket and prefix parameters.
 	For example, if bucket = "backups" and prefix = "my-app" and the directory structure is
@@ -211,13 +254,17 @@ func (w *WebDAVObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string)
 	"some-other-app/bridges/" is also missing as it does not use the specified prefix "my-app".
 	*/
 
+	if delimiter != w.delimiter {
+		w.log.Errorf("Got delimiter '%s', but expected '%s'. WebDAV backups may not work correctly.", delimiter, w.delimiter)
+	}
+
 	// prefix has to either be the empty string or end with /
 	// fix this if not already the case
 	prefixToUse := prefix
-	if prefixToUse != "" && !strings.HasSuffix(prefix, "/") {
-		prefixToUse = fmt.Sprintf("%s/", prefix)
+	if prefixToUse != "" && !strings.HasSuffix(prefix, delimiter) {
+		prefixToUse = fmt.Sprintf("%s%s", prefix, delimiter)
 	}
-	prefixToCut := fmt.Sprintf("%s%s/", w.bucketsDir, bucket)
+	prefixToCut := fmt.Sprintf("%s%s%s", w.bucketsDir, bucket, delimiter)
 
 	var rootDir string
 
@@ -256,18 +303,21 @@ func (w *WebDAVObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string)
 
 	if delimiter == "/" {
 		// traverse into all subdirectories
-		// if prefix != "" {
-		// 	// TODO: remove bucket name
-		// 	dirs = append(dirs, rootDir)
-		// }
 		dirs, _, err = AddDirsWithCommonPrefixes(w, c, dirs, rootSubdirs, rootDir, prefixToCut, rootDir)
 		if err != nil {
 			w.log.Errorf("Got error reading directories via WebDAV")
 			w.log.WithError(err)
+			return dirs, err
 		}
 	} else {
-		// TODO
 		// get all directory names and only return those matching the prefix
+		allFiles, err := GetAllFiles(w, c, dirs, rootSubdirs, rootDir)
+		if err != nil {
+			w.log.Errorf("Got error reading files via WebDAV")
+			w.log.WithError(err)
+			return dirs, err
+		}
+		dirs = DeterminePrefixesFromFilesWithDelimiter(allFiles, delimiter, prefixToCut)
 	}
 
 	return dirs, nil
@@ -275,10 +325,10 @@ func (w *WebDAVObjectStore) ListCommonPrefixes(bucket, prefix, delimiter string)
 
 func (w *WebDAVObjectStore) ListObjects(bucket, prefix string) ([]string, error) {
 	prefixToUse := prefix
-	if prefixToUse != "" && !strings.HasSuffix(prefix, "/") {
-		prefixToUse = fmt.Sprintf("%s/", prefix)
+	if prefixToUse != "" && !strings.HasSuffix(prefix, w.delimiter) {
+		prefixToUse = fmt.Sprintf("%s%s", prefix, w.delimiter)
 	}
-	path := fmt.Sprintf("%s%s/%s", w.bucketsDir, bucket, prefixToUse)
+	path := fmt.Sprintf("%s%s%s%s", w.bucketsDir, bucket, w.delimiter, prefixToUse)
 
 	var objects []string
 
@@ -301,10 +351,10 @@ func (w *WebDAVObjectStore) ListObjects(bucket, prefix string) ([]string, error)
 		}
 	}
 
-	prefixToCut := fmt.Sprintf("%s%s/", w.bucketsDir, bucket)
+	prefixToCut := fmt.Sprintf("%s%s%s", w.bucketsDir, bucket, w.delimiter)
 	for _, file := range files {
 		if !file.IsDir() {
-			completePath := fmt.Sprintf("%s%s/", path, file.Name())
+			completePath := fmt.Sprintf("%s%s%s", path, file.Name(), w.delimiter)
 			filenameWithoutBucket, found := strings.CutPrefix(completePath, prefixToCut)
 			if !found {
 				continue
@@ -316,7 +366,7 @@ func (w *WebDAVObjectStore) ListObjects(bucket, prefix string) ([]string, error)
 }
 
 func (w *WebDAVObjectStore) DeleteObject(bucket, key string) error {
-	path := fmt.Sprintf("%s%s/%s", w.bucketsDir, bucket, key)
+	path := fmt.Sprintf("%s%s%s%s", w.bucketsDir, bucket, w.delimiter, key)
 	dir, _ := SplitPathToDirAndFilename(path)
 
 	c := gowebdav.NewClient(w.root, w.user, w.password)
