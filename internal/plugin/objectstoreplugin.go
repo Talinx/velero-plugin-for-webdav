@@ -57,7 +57,6 @@ func (w *WebDAVObjectStore) Init(config map[string]string) error {
 	bucketsDir := config["bucketsDir"]
 	logLevel := config["logLevel"]
 	bucket := config["bucket"]
-	prefix := config["prefix"]
 	delimiter := config["delimiter"]
 	if delimiter == "" {
 		delimiter = "/"
@@ -88,7 +87,7 @@ func (w *WebDAVObjectStore) Init(config map[string]string) error {
 		w.log.Warnf("Using a delimiter other than '/' with the WebDAV plugin is experimental, please test your setup carefully. Delimiter is currently set to '%s'.", w.delimiter)
 	}
 	if w.PrintInfos() {
-		w.log.Infof("Using bucket '%s' with path prefix '%s'", bucket, prefix)
+		w.log.Infof("Using bucket '%s'", bucket)
 	}
 
 	return nil
