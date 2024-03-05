@@ -53,7 +53,7 @@ func (w WebDAVObjectStore) PrintWarnings() bool {
 func (w *WebDAVObjectStore) Init(config map[string]string) error {
 	root := config["root"]
 	user := config["user"]
-	password := config["password"]
+	password := config["webDAVPassword"]
 	bucketsDir := config["bucketsDir"]
 	logLevel := config["logLevel"]
 	bucket := config["bucket"]
